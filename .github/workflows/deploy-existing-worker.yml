@@ -1,0 +1,66 @@
+name: Deploy Existing Cloudflare Monitor
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', '.gitignore', 'LICENSE']
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Upstream Sync']
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cf-server-monitor-production
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.guard.outputs.enabled }}
+    steps:
+      - name: Check all deployment credentials exist
+        id: guard
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DATABASE: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          if [[ -n "$TOKEN" && -n "$ACCOUNT" && -n "$DATABASE" ]]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Deployment skipped until the three CLOUDFLARE_* / D1_DATABASE_ID secrets are configured.'
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: check
+    if: needs.check.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build:frontend
+      - name: Generate in-place production configuration
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/prepare-existing-worker-config.mjs
+      - name: Deploy to the existing Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4'
+          command: deploy --config wrangler.production.toml
